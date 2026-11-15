@@ -1,0 +1,11 @@
+{
+  "flow" : {
+    "createdTimestamp" : 1794713122625,
+    "description" : "Reusable template: one copy per API, settings from api_<name> parameter context",
+    "identifier" : "rest-api-to-snowflake-template",
+    "lastModifiedTimestamp" : 1794713122625,
+    "name" : "rest-api-to-snowflake-template",
+    "versionCount" : 0
+  },
+  "latest" : false
+}
