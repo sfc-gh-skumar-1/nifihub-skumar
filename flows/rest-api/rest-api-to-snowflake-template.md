@@ -5,6 +5,28 @@ The flow is a **template**: everything API-specific comes from parameters, so on
 serves any API. Deploy one copy per API and bind each copy to its own `api_<name>` parameter context.
 Failures on any path are posted to Slack and parked in a queue for inspection.
 
+## Modules
+
+The flow is split into four child process groups (modules), wired through ports on the parent:
+
+```
+[1 Start Run] ──Out──► [2 Fetch Pages] ──Out──► [3 Load to Snowflake]
+                          │Errors                    │Errors
+                          └──────────► [4 Alerting] ◄┘
+```
+
+| Module | Processors | Ports |
+|---|---|---|
+| `1 Start Run` | `1 Trigger`, `2 Init` | Out |
+| `2 Fetch Pages` | `3 Build URL`, `4 Call API`, `8 Read Paging Info`, `9 More Pages?`, `10a`/`10b`/`10c`, `Retry HTTP` | In, Out (one FlowFile per page response), Errors |
+| `3 Load to Snowflake` | `5 Split Records`, `6 Wrap as Row`, `7a Batch`, `7b Load to Snowflake` | In, Errors |
+| `4 Alerting` | `11 Alert: Slack`, `Errors (inspect queue)` | In |
+
+- The whole pagination loop stays inside `2 Fetch Pages`.
+- The JSON Reader / Writer controller services live on the parent and are shared by all modules.
+- Parameter contexts do **not** cascade to child groups: the parent **and every module** are bound
+  to the `api_<name>` context.
+
 ## How It Works
 
 1. `1 Trigger` (GenerateFlowFile) starts a run every `#{Schedule}`.
@@ -94,6 +116,15 @@ None beyond what an Openflow runtime ships: `nifi-standard-nar`, `nifi-update-at
 
 `INGESTED_AT` must be ISO-8601 (`yyyy-MM-dd'T'HH:mm:ss.SSS`); Snowpipe Streaming rejects
 space-separated timestamps for `TIMESTAMP_NTZ`.
+
+## Deploying a copy for another API
+
+1. Import from this registry (bucket `rest-api`, flow `rest-api-to-snowflake-template`) and rename
+   the process group, e.g. `REST API -> Snowflake (USGS)`.
+2. Bind the **parent and each of the four modules** to that API's `api_<name>` context
+   (Configure → Parameter Context on each group).
+3. Renaming and re-binding are not local modifications, and the bindings survive version upgrades,
+   so the copy keeps tracking new template versions (Version → Change version).
 
 ## Deployment
 

@@ -16,7 +16,8 @@
 """
 Validation tests for the REST API -> Snowflake (Template) flow.
 
-Structural tests validate the flow definition JSON without a running NiFi instance.
+Structural tests validate the flow definition JSON without a running NiFi instance. The flow is
+modular: processors live in child process groups wired through In / Out / Errors ports.
 Runtime tests run only when SNOWFLAKE_RUNTIME_URL, SNOWFLAKE_RUNTIME_PAT and DEPLOYED_PG_ID are set.
 """
 
@@ -42,6 +43,17 @@ PUT_SNOWPIPE = "com.snowflake.openflow.runtime.processors.snowpipe.PutSnowpipeSt
 SLACK = "11 Alert: Slack"
 ERRORS = "Errors (inspect queue)"
 
+MODULES = {
+    "1 Start Run": {"processors": {"1 Trigger", "2 Init"}, "in": [], "out": ["Out"]},
+    "2 Fetch Pages": {"processors": {"3 Build URL", "4 Call API", "8 Read Paging Info", "9 More Pages?",
+                                     "10a Next Page", "10b Next Offset", "10c Follow Next URL", "Retry HTTP"},
+                      "in": ["In"], "out": ["Errors", "Out"]},
+    "3 Load to Snowflake": {"processors": {"5 Split Records", "6 Wrap as Row", "7a Batch", "7b Load to Snowflake"},
+                            "in": ["In"], "out": ["Errors"]},
+    "4 Alerting": {"processors": {SLACK, ERRORS}, "in": ["In"], "out": []},
+}
+PORT_TYPES = {"INPUT_PORT", "OUTPUT_PORT"}
+
 PARAM_REF = re.compile(r"#\{([^}]+)\}")
 
 
@@ -56,14 +68,26 @@ def flow_contents(flow_data):
     return flow_data["flowContents"]
 
 
+def _groups(group):
+    """The group and all nested process groups."""
+    yield group
+    for child in group.get("processGroups", []):
+        yield from _groups(child)
+
+
+@pytest.fixture
+def modules(flow_contents):
+    return {g["name"]: g for g in flow_contents.get("processGroups", [])}
+
+
 @pytest.fixture
 def processors(flow_contents):
-    return flow_contents.get("processors", [])
+    return [p for g in _groups(flow_contents) for p in g.get("processors", [])]
 
 
 @pytest.fixture
 def connections(flow_contents):
-    return flow_contents.get("connections", [])
+    return [c for g in _groups(flow_contents) for c in g.get("connections", [])]
 
 
 @pytest.fixture
@@ -95,6 +119,21 @@ def _outgoing(connections, proc_id):
     return [c for c in connections if c["source"]["id"] == proc_id]
 
 
+def _next_processors(connections, conn):
+    """Processor names a connection delivers to, following ports across module boundaries."""
+    found, todo, seen = set(), [conn["destination"]], set()
+    while todo:
+        dest = todo.pop()
+        if dest["type"] not in PORT_TYPES:
+            found.add(dest["name"])
+            continue
+        if dest["id"] in seen:
+            continue
+        seen.add(dest["id"])
+        todo.extend(c["destination"] for c in connections if c["source"]["id"] == dest["id"])
+    return found
+
+
 class TestFlowStructure:
     def test_flow_is_valid_json(self, flow_data):
         assert flow_data is not None
@@ -107,6 +146,58 @@ class TestFlowStructure:
 
     def test_parameter_context_name(self, flow_contents):
         assert flow_contents.get("parameterContextName") == API_CONTEXT
+
+    def test_no_processors_at_top_level(self, flow_contents):
+        assert not flow_contents.get("processors"), "Processors belong in module process groups"
+
+
+class TestModules:
+    def test_expected_modules(self, modules):
+        assert set(modules) == set(MODULES)
+
+    @pytest.mark.parametrize("module", sorted(MODULES))
+    def test_module_processors(self, modules, module):
+        names = {p["name"] for p in modules[module].get("processors", [])}
+        assert names == MODULES[module]["processors"]
+
+    @pytest.mark.parametrize("module", sorted(MODULES))
+    def test_module_ports(self, modules, module):
+        group = modules[module]
+        assert sorted(p["name"] for p in group.get("inputPorts", [])) == MODULES[module]["in"]
+        assert sorted(p["name"] for p in group.get("outputPorts", [])) == MODULES[module]["out"]
+
+    @pytest.mark.parametrize("module", sorted(MODULES))
+    def test_module_bound_to_api_context(self, modules, module):
+        # Parameter contexts do not cascade to child groups; each module must be bound explicitly.
+        assert modules[module].get("parameterContextName") == API_CONTEXT
+
+    @pytest.mark.parametrize("src_module,src_port,dst_module,dst_port", [
+        ("1 Start Run", "Out", "2 Fetch Pages", "In"),
+        ("2 Fetch Pages", "Out", "3 Load to Snowflake", "In"),
+        ("2 Fetch Pages", "Errors", "4 Alerting", "In"),
+        ("3 Load to Snowflake", "Errors", "4 Alerting", "In"),
+    ])
+    def test_module_wiring(self, flow_contents, modules, src_module, src_port, dst_module, dst_port):
+        src = {p["name"]: p["identifier"] for p in modules[src_module].get("outputPorts", [])}[src_port]
+        dst = {p["name"]: p["identifier"] for p in modules[dst_module].get("inputPorts", [])}[dst_port]
+        assert any(c["source"]["id"] == src and c["destination"]["id"] == dst
+                   for c in flow_contents.get("connections", [])), \
+            f"Missing wiring {src_module}.{src_port} -> {dst_module}.{dst_port}"
+
+    def test_pagination_loop_stays_in_fetch_pages(self, modules):
+        fetch = modules["2 Fetch Pages"]
+        ids = {p["identifier"] for p in fetch.get("processors", [])}
+        loop_edges = {"10a Next Page": "success", "10b Next Offset": "success",
+                      "10c Follow Next URL": "success", "Retry HTTP": "retry"}
+        for c in fetch.get("connections", []):
+            if loop_edges.get(c["source"]["name"]) in c.get("selectedRelationships", []):
+                assert c["destination"]["id"] in ids, f"Loop edge from {c['source']['name']} leaves Fetch Pages"
+
+    def test_controller_services_on_parent(self, flow_contents, modules):
+        # Shared services live on the parent so every module can use them.
+        assert flow_contents.get("controllerServices"), "Parent should hold the shared controller services"
+        for name, group in modules.items():
+            assert not group.get("controllerServices"), f"{name} should not define its own services"
 
 
 class TestProcessors:
@@ -255,9 +346,9 @@ class TestConnections:
     ])
     def test_expected_route(self, connections, source, relationship, destination):
         matches = [c for c in connections
-                   if c["source"]["name"] == source and c["destination"]["name"] == destination
-                   and relationship in c["selectedRelationships"]]
-        assert matches, f"Missing connection {source} -[{relationship}]-> {destination}"
+                   if c["source"]["name"] == source and relationship in (c.get("selectedRelationships") or [])
+                   and destination in _next_processors(connections, c)]
+        assert matches, f"Missing route {source} -[{relationship}]-> {destination}"
 
 
 class TestFailureHandling:
@@ -270,9 +361,7 @@ class TestFailureHandling:
             dropped = self.FAILURE_RELATIONSHIPS & set(proc.get("autoTerminatedRelationships") or [])
             assert not dropped, f"{proc['name']} auto-terminates failure relationship(s) {dropped}"
 
-    def test_failure_relationships_alert_slack(self, processors, connections, by_name):
-        slack_id = by_name[SLACK]["identifier"]
-        retry_id = by_name["Retry HTTP"]["identifier"]
+    def test_failure_relationships_alert_slack(self, processors, connections):
         for proc in processors:
             if proc["name"] in (SLACK, ERRORS):
                 continue
@@ -280,10 +369,20 @@ class TestFailureHandling:
                 rels = self.FAILURE_RELATIONSHIPS & set(conn["selectedRelationships"])
                 if not rels:
                     continue
-                assert conn["destination"]["id"] in (slack_id, retry_id), (
-                    f"{proc['name']} {sorted(rels)} goes to {conn['destination']['name']}, "
-                    f"expected {SLACK} (or Retry HTTP)"
+                reached = _next_processors(connections, conn)
+                assert reached and reached <= {SLACK, "Retry HTTP"}, (
+                    f"{proc['name']} {sorted(rels)} reaches {sorted(reached)}, expected {SLACK} (or Retry HTTP)"
                 )
+
+    def test_module_errors_ports_reach_slack(self, modules, connections):
+        for name, group in modules.items():
+            for port in group.get("outputPorts", []):
+                if port["name"] != "Errors":
+                    continue
+                outgoing = [c for c in connections if c["source"]["id"] == port["identifier"]]
+                assert outgoing, f"{name}.Errors is not connected"
+                for c in outgoing:
+                    assert _next_processors(connections, c) == {SLACK}, f"{name}.Errors does not reach {SLACK}"
 
     def test_slack_never_drops_flowfiles(self, connections, by_name):
         slack_id = by_name[SLACK]["identifier"]
