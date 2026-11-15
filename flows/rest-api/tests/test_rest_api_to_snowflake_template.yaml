@@ -1,0 +1,59 @@
+# yaml-language-server: $schema=../../../scripts/ci/ci-runtime-schema.json
+github_environment: example
+deployment: MY_DEPLOYMENT
+database: OPENFLOW
+schema: OPENFLOW
+node_type: MEDIUM
+min_nodes: 1
+max_nodes: 1
+execute_as_role: OPENFLOW_RUNTIME_ROLE
+sensitive_param_pattern: ".*TOKEN.*|.*_KEY|.*SECRET.*"
+network_rules:
+  - name: GITHUB_API
+    type: HOST_PORT
+    mode: EGRESS
+    values:
+      - "api.github.com:443"
+  - name: REST_API_SOURCE
+    type: HOST_PORT
+    mode: EGRESS
+    values:
+      - "pokeapi.co:443"
+  - name: SLACK_API
+    type: HOST_PORT
+    mode: EGRESS
+    values:
+      - "slack.com:443"
+flow_registries:
+  - name: nifihub
+    type: org.apache.nifi.github.GitHubFlowRegistryClient
+    properties:
+      Repository Owner: Snowflake-Labs
+      Repository Name: nifihub
+      Authentication Type: PERSONAL_ACCESS_TOKEN
+      Personal Access Token: ${{ secrets.NIFIHUB_REGISTRY_PAT }}
+      Default Branch: main
+      Repository Path: flows
+flow:
+  parameters:
+    # api_pokeapi — public API, NEXT_URL pagination, capped at 3 pages for CI
+    Source Name: "pokeapi_pokemon"
+    API Base URL: "https://pokeapi.co/api/v2/pokemon"
+    API Key: "none"
+    Pagination Type: "NEXT_URL"
+    Page Param: "offset"
+    Size Param: "limit"
+    Page Size: "100"
+    Start Page: "0"
+    Records JsonPath: "$.results"
+    Next URL JsonPath: "$.next"
+    Max Pages: "3"
+    Schedule: "1 day"
+    # snowflake_common — target table must exist and be writable by execute_as_role
+    Snowflake Database: "OPENFLOW"
+    Snowflake Schema: "API_RAW"
+    Snowflake Table: "API_LANDING"
+    Snowflake Role: "OPENFLOW_RUNTIME_ROLE"
+    # alerting_common — no Slack token in CI: 11 Alert: Slack stays invalid/stopped, so any failure
+    # stays queued in front of it (asserted by test_nothing_reached_failure_paths).
+    Slack Channel: "#openflow-alerts"
